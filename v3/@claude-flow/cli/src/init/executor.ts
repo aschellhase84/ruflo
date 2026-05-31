@@ -26,6 +26,7 @@ import {
   generateHookHandler,
   generateIntelligenceStub,
   generateAutoMemoryHook,
+  generateRufloHookCjs,
 } from './helpers-generator.js';
 import { generateClaudeMd } from './claudemd-generator.js';
 
@@ -831,21 +832,28 @@ function detectExistingRufloMCP(targetDir: string): string | null {
     try {
       const parsed = JSON.parse(fs.readFileSync(candidate, 'utf-8'));
       if (!parsed || typeof parsed !== 'object') continue;
-      // (a) Top-level mcpServers (legacy / global form)
+      // (a) Top-level mcpServers (legacy / global form).
+      // #2207: accept BOTH the old 'ruflo' key AND the new 'claude-flow' key so that
+      // a prior install with either key is correctly detected as already-initialized.
+      // This also avoids the reverse problem: after #2206 fixed the generator to write
+      // 'claude-flow', a second `ruflo init` must still recognise the existing install.
       if (parsed.mcpServers && typeof parsed.mcpServers === 'object') {
-        if ('ruflo' in parsed.mcpServers) return candidate;
+        const servers = parsed.mcpServers as Record<string, unknown>;
+        if ('claude-flow' in servers || 'ruflo' in servers) return candidate;
       }
       // (b) #1840: Claude Code project-scoped registrations under
-      //     parsed.projects[<projectPath>].mcpServers.ruflo. Match by
+      //     parsed.projects[<projectPath>].mcpServers. Match by
       //     normalized path against targetDir or any of its ancestors so
-      //     a `claude mcp add ruflo` in this repo is detected even when
-      //     Claude stored the key with different casing/slash style.
+      //     a `claude mcp add claude-flow` (or legacy `ruflo`) in this repo is
+      //     detected even when Claude stored the key with different casing/slash style.
+      // #2207: accept both keys here too.
       if (parsed.projects && typeof parsed.projects === 'object') {
         for (const [projectKey, projectVal] of Object.entries(parsed.projects)) {
           if (!projectVal || typeof projectVal !== 'object') continue;
           const projectMcp = (projectVal as { mcpServers?: unknown }).mcpServers;
           if (!projectMcp || typeof projectMcp !== 'object') continue;
-          if (!('ruflo' in (projectMcp as Record<string, unknown>))) continue;
+          const mcp = projectMcp as Record<string, unknown>;
+          if (!('claude-flow' in mcp) && !('ruflo' in mcp)) continue;
           if (targetAncestors.has(normalizeProjectKey(projectKey))) {
             return `${candidate} (projects[${projectKey}])`;
           }
@@ -1147,6 +1155,12 @@ async function writeHelpers(
   // Find source helpers directory (works for npm package and local dev)
   const sourceHelpersDir = findSourceHelpersDir(options.sourceBaseDir);
 
+  // On Windows: emit a notice before writing helpers — the settings.json
+  // hooks will use node-based commands instead of bash shims (#2132).
+  if (process.platform === 'win32') {
+    console.log('Detected Windows — adding cross-platform hook overrides to .claude/settings.json (#2132)');
+  }
+
   // Try to copy existing helpers from source first
   if (sourceHelpersDir && fs.existsSync(sourceHelpersDir)) {
     const helperFiles = fs.readdirSync(sourceHelpersDir);
@@ -1174,6 +1188,18 @@ async function writeHelpers(
       }
     }
 
+    // #2132: Always generate ruflo-hook.cjs regardless of source copy path.
+    // The source helpers dir may not contain this file (it lives in
+    // plugins/ruflo-core/scripts/, not .claude/helpers/), but it must
+    // always be present so Windows users can use the node-based shim.
+    const rufloHookDest = path.join(helpersDir, 'ruflo-hook.cjs');
+    if (!fs.existsSync(rufloHookDest) || options.force) {
+      fs.writeFileSync(rufloHookDest, generateRufloHookCjs(), 'utf-8');
+      result.created.files.push('.claude/helpers/ruflo-hook.cjs');
+    } else {
+      result.skipped.push('.claude/helpers/ruflo-hook.cjs');
+    }
+
     if (copiedCount > 0) {
       return; // Skip generating if we copied from source
     }
@@ -1189,6 +1215,10 @@ async function writeHelpers(
     'hook-handler.cjs': generateHookHandler(),
     'intelligence.cjs': generateIntelligenceStub(),
     'auto-memory-hook.mjs': generateAutoMemoryHook(),
+    // #2132: cross-platform Node.js port of ruflo-hook.sh — always deployed so
+    // Windows users have a working shim even if the plugin's hooks.json bash
+    // commands are overridden via settings.json.
+    'ruflo-hook.cjs': generateRufloHookCjs(),
   };
 
   for (const [name, content] of Object.entries(helpers)) {
@@ -1937,6 +1967,18 @@ async function writeClaudeMd(
   if (fs.existsSync(claudeMdPath) && !options.force) {
     result.skipped.push('CLAUDE.md');
   } else {
+    // #2208: if overwriting an existing CLAUDE.md (force mode), back it up first so
+    // users don't silently lose curated project context.
+    if (fs.existsSync(claudeMdPath)) {
+      const backupBase = `${claudeMdPath}.pre-ruflo`;
+      // Don't clobber an existing backup — append a timestamp if one already exists.
+      const backupPath = fs.existsSync(backupBase)
+        ? `${backupBase}.${Date.now()}`
+        : backupBase;
+      fs.copyFileSync(claudeMdPath, backupPath);
+      result.created.files.push(path.basename(backupPath));
+      console.warn(`[ruflo init] Existing CLAUDE.md backed up to ${path.basename(backupPath)} before overwrite`);
+    }
     // Determine template: explicit option > infer from components > 'standard'
     const inferredTemplate = (!options.components.commands && !options.components.agents) ? 'minimal' : undefined;
     const content = generateClaudeMd(options, inferredTemplate);

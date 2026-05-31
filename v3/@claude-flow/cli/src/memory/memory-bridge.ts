@@ -568,6 +568,13 @@ export async function bridgeStoreEntry(options: {
     const id = generateId('entry');
     const now = Date.now();
 
+    // #2245 — record the activity so signalsProcessed stops being a dead
+    // zero. Fire-and-forget; never blocks the write path.
+    try {
+      const intel = await import('./intelligence.js');
+      intel.recordSignalProcessed();
+    } catch { /* intelligence module not yet initialised */ }
+
     // Phase 5: MutationGuard validation before write
     const guardResult = await guardValidate(registry, 'store', { key, namespace, size: value.length });
     if (!guardResult.allowed) {
@@ -822,11 +829,21 @@ export async function bridgeListEntries(options: {
     const nsFilter = namespace ? `AND namespace = ?` : '';
     const nsParams = namespace ? [namespace] : [];
 
+    // #2120 — `status IS NULL` accepted alongside `'active'`. Old
+    // databases imported by the auto-memory bridge (before the status
+    // column existed) end up with NULL status after schema migration if
+    // the migration ran on an existing DB without a backfill. Reporter
+    // @alexandrelealbess on WSL2 had 251 entries with NULL status, so
+    // the `status = 'active'` filter matched zero. Treat NULL as
+    // "legacy-active" — the safe default for any entry that predates the
+    // status column.
+    const statusFilter = `(status = 'active' OR status IS NULL)`;
+
     // Count
     let total = 0;
     try {
       const countStmt = ctx.db.prepare(
-        `SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' ${nsFilter}`
+        `SELECT COUNT(*) as cnt FROM memory_entries WHERE ${statusFilter} ${nsFilter}`
       );
       const countRow = countStmt.get(...nsParams);
       total = countRow?.cnt ?? 0;
@@ -840,7 +857,7 @@ export async function bridgeListEntries(options: {
       const stmt = ctx.db.prepare(`
         SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at
         FROM memory_entries
-        WHERE status = 'active' ${nsFilter}
+        WHERE ${statusFilter} ${nsFilter}
         ORDER BY updated_at DESC
         LIMIT ? OFFSET ?
       `);
@@ -1068,7 +1085,7 @@ export async function bridgeDeleteEntry(options: {
 export async function bridgeGenerateEmbedding(
   text: string,
   dbPath?: string,
-): Promise<{ embedding: number[]; dimensions: number; model: string } | null> {
+): Promise<{ embedding: number[]; dimensions: number; model: string; backend?: 'onnx' | 'mock' } | null> {
   const registry = await getRegistry(dbPath);
   if (!registry) return null;
 
@@ -1080,10 +1097,16 @@ export async function bridgeGenerateEmbedding(
     const emb = await embedder.embed(text);
     if (!emb) return null;
 
+    // AUDIT #3: surface backend truthfully. AgentDB's embedder is a real ONNX
+    // model when present; if it ever exposes a mock/stub signal, honor it.
+    const isMock = (embedder as { isMock?: boolean; backend?: string }).isMock === true
+      || (embedder as { backend?: string }).backend === 'mock';
+
     return {
       embedding: Array.from(emb),
       dimensions: emb.length,
       model: 'Xenova/all-MiniLM-L6-v2',
+      backend: isMock ? 'mock' : 'onnx',
     };
   } catch {
     return null;
@@ -1461,6 +1484,42 @@ export async function bridgeSearchPatterns(options: {
         })) : [],
         controller: 'reasoningBank',
       };
+    }
+
+    // #2226 — the wired-in LocalReasoningBank implements store() + findSimilar()/getAll()
+    // but NOT searchPatterns()/search(). bridgeStorePattern commits patterns to its
+    // store(), so search MUST read the SAME backend or stored patterns are never found
+    // (previously search fell through to the disjoint sql.js 'pattern' namespace, which
+    // the store never wrote to → always-empty results). Adapt findSimilar (semantic) with
+    // a getAll() substring fallback so freshly-stored patterns are visible. This mirrors
+    // what hooks_intelligence_pattern-search already does against the same backend.
+    if (reasoningBank && typeof reasoningBank.findSimilar === 'function') {
+      const k = options.topK || 5;
+      const threshold = options.minConfidence ?? 0.3;
+      let mapped: Array<{ id: string; content: string; score: number }> = [];
+      try {
+        const { generateEmbedding } = await import('./memory-initializer.js');
+        const qEmb = await generateEmbedding(options.query);
+        if (qEmb && Array.isArray(qEmb.embedding) && qEmb.embedding.length > 0) {
+          const hits = reasoningBank.findSimilar(qEmb.embedding, { k, threshold });
+          mapped = (Array.isArray(hits) ? hits : []).map((r: any) => ({
+            id: r.id ?? '',
+            content: r.content ?? '',
+            score: r.confidence ?? r.score ?? 0,
+          }));
+        }
+      } catch { /* embedding unavailable — fall through to substring scan */ }
+
+      // Deterministic substring fallback over the same in-memory store.
+      if (mapped.length === 0 && typeof reasoningBank.getAll === 'function') {
+        const q = options.query.toLowerCase();
+        mapped = (reasoningBank.getAll() as any[])
+          .filter((p: any) => typeof p.content === 'string' && p.content.toLowerCase().includes(q))
+          .slice(0, k)
+          .map((p: any) => ({ id: p.id ?? '', content: p.content ?? '', score: p.confidence ?? 0 }));
+      }
+
+      return { results: mapped, controller: 'reasoningBank' };
     }
 
     // Fallback: search via bridge
@@ -2411,4 +2470,47 @@ function cosineSim(a: number[], b: number[]): number {
   }
   const mag = Math.sqrt(normA * normB);
   return mag === 0 ? 0 : dot / mag;
+}
+
+/**
+ * Public helper for the unified learning-stats aggregator: counts of entries
+ * per namespace + the top-level total. Best-effort — if the bridge isn't
+ * available it returns zeros so the aggregator can still report the other
+ * stores honestly. (#2245 follow-up.)
+ */
+export async function getMemoryBridgeStats(options: {
+  namespaces?: string[];
+  dbPath?: string;
+} = {}): Promise<{
+  totalEntries: number;
+  perNamespace: Record<string, number>;
+  source: string;
+  reachable: boolean;
+}> {
+  const namespaces = options.namespaces ?? [
+    'default', 'patterns', 'claude-memories', 'auto-memory',
+    'tasks', 'feedback', 'pretrain', 'trajectories',
+  ];
+  try {
+    const all = await bridgeListEntries({ dbPath: options.dbPath, limit: 1 });
+    if (!all) {
+      return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (unreachable)', reachable: false };
+    }
+    const perNamespace: Record<string, number> = {};
+    for (const ns of namespaces) {
+      try {
+        const r = await bridgeListEntries({ namespace: ns, dbPath: options.dbPath, limit: 1 });
+        const n = r?.total ?? 0;
+        if (n > 0) perNamespace[ns] = n;
+      } catch { /* skip per-namespace failure */ }
+    }
+    return {
+      totalEntries: all.total,
+      perNamespace,
+      source: 'memory-bridge AgentDB (bridgeListEntries)',
+      reachable: true,
+    };
+  } catch {
+    return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (error)', reachable: false };
+  }
 }

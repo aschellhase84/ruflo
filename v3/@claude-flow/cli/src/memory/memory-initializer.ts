@@ -70,9 +70,34 @@ export function _resetMemoryRootCache(): void {
   _memoryRootCache = undefined;
 }
 
+/**
+ * #2105: Resolve the full path to the SQLite memory database.
+ * Precedence (highest to lowest):
+ *   1. cliFlag             - explicit --path flag passed by a subcommand
+ *   2. CLAUDE_FLOW_DB_PATH - full file-path override (new in #2105)
+ *   3. getMemoryRoot()/memory.db - directory from CLAUDE_FLOW_MEMORY_PATH /
+ *                                  config / default cwd/.swarm
+ */
+export function resolveDbPath(cliFlag?: string): string {
+  if (cliFlag && cliFlag.trim().length > 0) {
+    return path.resolve(cliFlag);
+  }
+  const envDb = process.env.CLAUDE_FLOW_DB_PATH;
+  if (envDb && envDb.trim().length > 0) {
+    return path.resolve(envDb);
+  }
+  return path.join(getMemoryRoot(), 'memory.db');
+}
+
 // ADR-053: Lazy import of AgentDB v3 bridge
 let _bridge: typeof import('./memory-bridge.js') | null | undefined;
 async function getBridge(): Promise<typeof import('./memory-bridge.js') | null> {
+  // #2120 — Allow callers to force the raw sql.js fallback path. The
+  // ensureSchemaColumns backfill (NULL → 'active') lives in that
+  // fallback, so smokes that verify legacy-DB migration semantics need a
+  // way to bypass the bridge. Also useful when the bridge would hang on
+  // network-bound init (Xenova model fetch) in offline CI.
+  if (process.env.CLAUDE_FLOW_DISABLE_BRIDGE === '1') return null;
   if (_bridge === null) return null;
   if (_bridge) return _bridge;
   try {
@@ -367,6 +392,36 @@ CREATE TABLE IF NOT EXISTS vector_indexes (
   created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
   updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
 );
+
+-- ============================================
+-- GRAPH EDGES (ADR-130 Phase 1)
+-- Unified knowledge graph backend — sql.js canonical store
+-- ============================================
+
+-- Unified graph edges table (ADR-130)
+-- Node IDs use domain-prefixed format: {domain}:{uuid}
+-- where domain in (mem, agent, task, entity, span, pattern)
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id              TEXT PRIMARY KEY,          -- edge-{uuid}
+  source_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  target_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  relation        TEXT NOT NULL,             -- e.g. "caused", "depends-on", "imports"
+  weight          REAL DEFAULT 1.0,
+  -- Temporal / reliability semantics (ADR-130 §"graph that forgets" property)
+  confidence      REAL DEFAULT 1.0,          -- [0,1]; updated by JUDGE step
+  decay_rate      REAL DEFAULT 0.0,          -- per-day exponential decay applied at read time
+  last_reinforced TEXT,                      -- ISO-8601; set when CONSOLIDATE re-touches edge
+  witness_id      TEXT,                      -- FK to verification/witness-fixes.json (ADR-103)
+  -- Embedding storage: "inline:{base64}" | "vector_indexes:{id}" | NULL
+  embedding_ref   TEXT,
+  metadata        TEXT,                      -- JSON blob for plugin-specific fields
+  created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_edges_source    ON graph_edges (source_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target    ON graph_edges (target_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_relation  ON graph_edges (relation);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_reinforced ON graph_edges (last_reinforced);
 
 -- ============================================
 -- SYSTEM METADATA
@@ -1084,6 +1139,23 @@ export async function ensureSchemaColumns(dbPath: string): Promise<{
       }
     }
 
+    // #2120 — Belt-and-suspenders backfill. `ALTER TABLE ADD COLUMN
+    // status TEXT DEFAULT 'active'` should populate existing rows with
+    // 'active' in modern SQLite, but: (a) some auto-memory bridge writes
+    // happen via INSERT paths that pass an explicit NULL, (b) some
+    // historical sql.js builds skipped the DEFAULT backfill, (c)
+    // entries can be migrated in from older snapshots. After ensuring
+    // the column exists, force-backfill any remaining NULL → 'active'.
+    // Safe on already-correct DBs (0 rows updated).
+    if (columnsAdded.includes('status') || existingColumns.has('status')) {
+      try {
+        db.run(`UPDATE memory_entries SET status = 'active' WHERE status IS NULL`);
+        modified = true;
+      } catch {
+        /* table is read-only or doesn't exist — skip */
+      }
+    }
+
     if (modified) {
       // Save updated database
       const data = db.export();
@@ -1765,17 +1837,34 @@ export async function loadEmbeddingModel(options?: {
 /**
  * Generate real embedding for text
  * Uses ONNX model if available, falls back to deterministic hash
+ *
+ * AUDIT #3: the `backend` field is the authoritative signal for whether the
+ * returned vector carries real ONNX semantics ('onnx') or the deterministic
+ * hash fallback ('mock'). The hash fallback produces inverted/meaningless
+ * semantics, so operators MUST be able to tell the two apart even when the
+ * `model` string reports a real model name (e.g. the AgentDB bridge always
+ * labels its output 'Xenova/all-MiniLM-L6-v2' regardless of whether AgentDB's
+ * own embedder is real or stubbed). Set `backend` truthfully by the path that
+ * actually produced the vector. Do NOT change the embedding math.
  */
 export async function generateEmbedding(text: string): Promise<{
   embedding: number[];
   dimensions: number;
   model: string;
+  backend: 'onnx' | 'mock';
 }> {
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeGenerateEmbedding(text);
-    if (bridgeResult) return bridgeResult;
+    if (bridgeResult) {
+      // The bridge labels its output with a real model name unconditionally;
+      // honor the backend it reports if present, otherwise treat a real model
+      // name as ONNX (the bridge only returns when AgentDB's embedder exists).
+      const backend: 'onnx' | 'mock' =
+        (bridgeResult as { backend?: 'onnx' | 'mock' }).backend ?? 'onnx';
+      return { ...bridgeResult, backend };
+    }
   }
 
   // Ensure model is loaded
@@ -1797,7 +1886,8 @@ export async function generateEmbedding(text: string): Promise<{
         return {
           embedding,
           dimensions: embedding.length,
-          model: 'onnx'
+          model: 'onnx',
+          backend: 'onnx'
         };
       }
     } catch {
@@ -1805,12 +1895,14 @@ export async function generateEmbedding(text: string): Promise<{
     }
   }
 
-  // Deterministic hash-based fallback (for testing/demo without ONNX)
+  // Deterministic hash-based fallback (for testing/demo without ONNX).
+  // AUDIT #3: backend='mock' — these vectors do NOT carry real semantics.
   const embedding = generateHashEmbedding(text, state.dimensions);
   return {
     embedding,
     dimensions: state.dimensions,
-    model: 'hash-fallback'
+    model: 'hash-fallback',
+    backend: 'mock'
   };
 }
 
@@ -2541,10 +2633,13 @@ export async function listEntries(options: {
     const fileBuffer = readFileMaybeEncrypted(dbPath, null);
     const db = new SQL.Database(fileBuffer);
 
+    // #2120 — accept `status IS NULL` alongside `'active'`. Old DBs
+    // that predate the status column may have NULL after migration.
+    // See memory-bridge.ts:bridgeListEntries for full context.
     // Get total count
     const countStmt = namespace
-      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' AND namespace = ?`)
-      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`);
+      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE (status = 'active' OR status IS NULL) AND namespace = ?`)
+      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE (status = 'active' OR status IS NULL)`);
     if (namespace) {
       countStmt.bind([namespace]);
     }
@@ -2559,9 +2654,10 @@ export async function listEntries(options: {
     // Get entries
     const safeLimit = parseInt(String(limit), 10) || 100;
     const safeOffset = parseInt(String(offset), 10) || 0;
+    // #2120 — same NULL-as-active acceptance as the count above.
     const listStmt = namespace
-      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
-      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE (status = 'active' OR status IS NULL) AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE (status = 'active' OR status IS NULL) ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
     if (namespace) {
       listStmt.bind([namespace, safeLimit, safeOffset]);
     } else {

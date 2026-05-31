@@ -926,6 +926,16 @@ export const memoryTools: MCPTool[] = [
         }
       }
 
+      // AUDIT #3: report the embedding backend truthfully — a hash-fallback
+      // import is NOT semantically searchable, so an operator must not read
+      // "ONNX ... (384-dim)" when the vectors are mock.
+      let importBackend: 'onnx' | 'mock' | 'unknown' = 'unknown';
+      try {
+        const { generateEmbedding } = await import('../memory/memory-initializer.js');
+        const probe = await generateEmbedding('memory_import_claude backend probe');
+        importBackend = probe.backend ?? 'unknown';
+      } catch { /* probe failed — leave 'unknown' */ }
+
       return {
         success: true,
         imported,
@@ -935,7 +945,8 @@ export const memoryTools: MCPTool[] = [
         files: memoryFiles.length,
         projects: projects.size,
         namespace: ns,
-        embedding: 'ONNX all-MiniLM-L6-v2 (384-dim)',
+        embedding: `all-MiniLM-L6-v2 (384-dim, backend=${importBackend})`,
+        embeddingBackend: importBackend,
       };
     },
   },
@@ -1001,14 +1012,37 @@ export const memoryTools: MCPTool[] = [
         if (stats) intelligence = { sonaEnabled: stats.sonaEnabled, patternsLearned: stats.patternsLearned, trajectoriesRecorded: stats.trajectoriesRecorded };
       } catch { /* not initialized */ }
 
+      // AUDIT #3: probe the embedding backend so operators can tell real ONNX
+      // output from the deterministic hash fallback (which has inverted/
+      // meaningless semantics). Without this, the status string reports the
+      // model name unconditionally and mock output is indistinguishable.
+      let embeddingBackend: 'onnx' | 'mock' | 'unknown' = 'unknown';
+      try {
+        const { generateEmbedding } = await import('../memory/memory-initializer.js');
+        const probe = await generateEmbedding('memory_bridge_status backend probe');
+        embeddingBackend = probe.backend ?? 'unknown';
+      } catch { /* probe failed — leave 'unknown' */ }
+
+      const embeddingLabel = `all-MiniLM-L6-v2 (384-dim, backend=${embeddingBackend})`;
+
       return {
         claudeCode: { memoryFiles: claudeFiles, projects: claudeProjects },
-        agentdb: { totalEntries: agentdbEntries, claudeMemoryEntries, namespaces: namespaceCounts, backend: 'sql.js + ONNX' },
+        agentdb: {
+          totalEntries: agentdbEntries,
+          claudeMemoryEntries,
+          namespaces: namespaceCounts,
+          backend: embeddingBackend === 'mock' ? 'sql.js + MOCK (hash fallback)' : 'sql.js + ONNX',
+          embeddingBackend,
+        },
         intelligence,
         // #1940: report 'connected' whenever ANY namespace has imported
         // content, not just `claude-memories` — the bridge can be in active
         // use from other import paths (e.g. plugin namespaces, task memory).
-        bridge: { status: agentdbEntries > 0 ? 'connected' : 'not-synced', embedding: 'all-MiniLM-L6-v2 (384-dim)' },
+        bridge: {
+          status: agentdbEntries > 0 ? 'connected' : 'not-synced',
+          embedding: embeddingLabel,
+          embeddingBackend,
+        },
       };
     },
   },
@@ -1022,23 +1056,58 @@ export const memoryTools: MCPTool[] = [
       properties: {
         query: { type: 'string', description: 'Search query (natural language)' },
         limit: { type: 'number', description: 'Max results (default: 10)' },
-        namespace: { type: 'string', description: 'Filter to namespace (omit for all)' },
+        namespace: { type: 'string', description: 'Filter to a single namespace (mutually exclusive with `namespaces`)' },
+        namespaces: { type: 'array', items: { type: 'string' }, description: 'Explicit list of namespaces to fan out across (overrides defaults and env)' },
       },
       required: ['query'],
     },
     handler: async (input) => {
       await ensureInitialized();
-      const { searchEntries } = await getMemoryFunctions();
+      const { searchEntries, listEntries } = await getMemoryFunctions();
       validateMemoryInput(undefined, undefined, input.query as string);
 
       const query = input.query as string;
       const limit = (input.limit as number) ?? 10;
       const ns = input.namespace as string | undefined;
+      const nsList = Array.isArray(input.namespaces) ? (input.namespaces as string[]) : undefined;
 
       if (ns) { const vNs = validateIdentifier(ns, 'namespace'); if (!vNs.valid) return { success: false, query, results: [], total: 0, error: vNs.error }; }
+      if (nsList) {
+        for (const n of nsList) { const v = validateIdentifier(n, 'namespaces[]'); if (!v.valid) return { success: false, query, results: [], total: 0, error: v.error }; }
+      }
 
-      // Search all namespaces unless filtered
-      const namespaces = ns ? [ns] : ['default', 'claude-memories', 'auto-memory', 'patterns', 'tasks', 'feedback'];
+      // #2246 fix: namespace resolution priority is
+      //   1. explicit single `namespace` (back-compat)
+      //   2. explicit `namespaces: string[]` (new in 3.10.29)
+      //   3. env var CLAUDE_FLOW_MEMORY_SEARCH_NAMESPACES (CSV)
+      //   4. dynamic enumeration via listEntries({}) over the actual store
+      //   5. legacy 6-namespace hardcode as last-resort fallback
+      // The legacy default was silently missing ~95% of entries on stores with
+      // custom namespaces (issue #2246). Dynamic enumeration fixes that.
+      const LEGACY_DEFAULT = ['default', 'claude-memories', 'auto-memory', 'patterns', 'tasks', 'feedback'];
+      let namespaces: string[];
+      let namespaceSource: 'param-single' | 'param-list' | 'env' | 'dynamic' | 'legacy-fallback';
+      if (ns) {
+        namespaces = [ns]; namespaceSource = 'param-single';
+      } else if (nsList && nsList.length > 0) {
+        namespaces = nsList; namespaceSource = 'param-list';
+      } else if (process.env.CLAUDE_FLOW_MEMORY_SEARCH_NAMESPACES) {
+        namespaces = process.env.CLAUDE_FLOW_MEMORY_SEARCH_NAMESPACES.split(',').map(s => s.trim()).filter(Boolean);
+        namespaceSource = 'env';
+      } else {
+        // Dynamic enumeration — list all entries and collect distinct namespaces.
+        // Cap entries at 100k to bound memory; in practice this is fast (<200ms).
+        try {
+          const all = await listEntries({ limit: 100000 });
+          const seenNs = new Set<string>();
+          for (const e of all?.entries ?? []) if (e.namespace) seenNs.add(e.namespace);
+          namespaces = seenNs.size > 0 ? Array.from(seenNs).sort() : LEGACY_DEFAULT;
+          namespaceSource = seenNs.size > 0 ? 'dynamic' : 'legacy-fallback';
+        } catch {
+          namespaces = LEGACY_DEFAULT; namespaceSource = 'legacy-fallback';
+        }
+      }
+
       const allResults: Array<{ key: string; content: string; score: number; namespace: string; source: string }> = [];
 
       for (const searchNs of namespaces) {
@@ -1073,6 +1142,7 @@ export const memoryTools: MCPTool[] = [
         results: deduplicated,
         total: deduplicated.length,
         searchedNamespaces: namespaces,
+        namespaceSource,        // #2246 — surface how the namespace list was resolved
         searchTime: Date.now(),
       };
     },
