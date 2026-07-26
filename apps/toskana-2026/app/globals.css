@@ -1,0 +1,165 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    /* Höhe der schwebenden Navigation — Scroll-Ziele halten diesen Abstand ein. */
+    --nav-offset: 5.5rem;
+  }
+
+  html {
+    /* Smooth Scrolling für Anker-Navigation ... */
+    scroll-behavior: smooth;
+    scroll-padding-top: var(--nav-offset);
+    -webkit-text-size-adjust: 100%;
+
+    /* Slide-In-Animationen starten seitlich versetzt und ragen dabei kurz
+       über den Viewport hinaus. `clip` schneidet das ab, OHNE — anders als
+       `hidden` — einen Scroll-Container zu erzeugen; `position: sticky`
+       (Panorama, Sticky-Story) funktioniert dadurch weiterhin. */
+    overflow-x: clip;
+  }
+
+  /* ... aber niemals gegen den Nutzerwunsch. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  body {
+    @apply bg-offwhite font-sans text-ink-600 antialiased;
+    overflow-x: clip;
+  }
+
+  /* Sichtbarer, ruhiger Fokusring — überall gleich. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-terracotta-500 ring-offset-2 ring-offset-offwhite;
+    border-radius: 0.25rem;
+  }
+
+  ::selection {
+    @apply bg-terracotta-500/25 text-ink-900;
+  }
+
+  h1,
+  h2,
+  h3 {
+    @apply font-display font-normal text-ink-800;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer components {
+  /* Ruhige Glassmorphism-Fläche — Basis für Navigation, Karten und Labels. */
+  .glass {
+    @apply border border-white/40 bg-white/60 shadow-[0_10px_40px_-18px_rgba(20,20,18,0.35)] backdrop-blur-xl backdrop-saturate-150;
+  }
+
+  .glass-dark {
+    @apply border border-white/15 bg-ink-950/45 shadow-[0_16px_50px_-20px_rgba(0,0,0,0.7)] backdrop-blur-xl backdrop-saturate-150;
+  }
+
+  /* Kleines Kapitel-Label über Überschriften. */
+  .eyebrow {
+    @apply font-sans text-[0.625rem] font-medium uppercase tracking-overline sm:text-[0.6875rem];
+  }
+
+  /* Feine Trennlinie im Sandton. */
+  .hairline {
+    @apply h-px w-full bg-gradient-to-r from-transparent via-sand-400/50 to-transparent;
+  }
+
+  /* Horizontale Scrollbereiche: Snap + versteckte Scrollbar, Swipe bleibt aktiv. */
+  .scroll-row {
+    @apply flex snap-x snap-mandatory overflow-x-auto overscroll-x-contain;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .scroll-row::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer utilities {
+  /* Weicher Verlauf über Bildern, damit heller Text immer lesbar bleibt. */
+  .scrim {
+    background: linear-gradient(
+      to top,
+      rgba(11, 11, 9, 0.82) 0%,
+      rgba(11, 11, 9, 0.55) 28%,
+      rgba(11, 11, 9, 0.18) 60%,
+      rgba(11, 11, 9, 0.32) 100%
+    );
+  }
+
+  .scrim-soft {
+    background: linear-gradient(
+      to top,
+      rgba(11, 11, 9, 0.66) 0%,
+      rgba(11, 11, 9, 0.22) 55%,
+      rgba(11, 11, 9, 0.05) 100%
+    );
+  }
+
+  /* Papierartige Textur — sehr dezent, hält große Flächen lebendig. */
+  .grain::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.35;
+    mix-blend-mode: multiply;
+    background-image: radial-gradient(
+        circle at 20% 20%,
+        rgba(184, 161, 126, 0.12) 0,
+        transparent 45%
+      ),
+      radial-gradient(circle at 80% 70%, rgba(111, 124, 85, 0.1) 0, transparent 40%);
+  }
+
+  /* Große typografische Inszenierung — skaliert sauber vom iPhone bis 4K. */
+  .display-xl {
+    font-size: clamp(3rem, 13vw, 11rem);
+    line-height: 0.92;
+    letter-spacing: -0.035em;
+  }
+
+  .display-lg {
+    font-size: clamp(2.25rem, 7.5vw, 5.5rem);
+    line-height: 0.98;
+    letter-spacing: -0.03em;
+  }
+
+  .display-md {
+    font-size: clamp(1.75rem, 5vw, 3.5rem);
+    line-height: 1.06;
+    letter-spacing: -0.02em;
+  }
+
+  .lede {
+    font-size: clamp(1.0625rem, 1.6vw, 1.3125rem);
+    line-height: 1.72;
+  }
+
+  /* Skip-Link: erst bei Tastaturfokus sichtbar. */
+  .skip-link {
+    @apply fixed left-4 top-4 z-[100] -translate-y-24 rounded-full bg-ink-900 px-5 py-3 text-sm text-offwhite transition-transform duration-300 focus-visible:translate-y-0;
+  }
+}

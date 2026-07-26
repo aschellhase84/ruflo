@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Toskana 2026">
+  <rect width="32" height="32" rx="8" fill="#22221E"/>
+  <circle cx="21" cy="11" r="4" fill="#E2A57C"/>
+  <path d="M0 24c5-6 9-6 13 0 3-4 7-4 10 0 3-3 6-3 9 0v8H0z" fill="#8E9A72"/>
+  <path d="M0 28c6-4 10-4 15 0 4-3 8-3 12 0 2-1 3-1 5 0v4H0z" fill="#556042"/>
+</svg>
