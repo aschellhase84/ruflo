@@ -17,7 +17,7 @@
  * Reines Node (zlib) — bewusst ohne Abhängigkeiten, damit der Build überall läuft.
  */
 import { deflateSync } from 'node:zlib';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,6 +43,22 @@ const TONES = {
 /* ------------------------------------------------------------------ */
 /* Bild-Manifest — Name, Maße, Farbwelt, Motiv                         */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Skalierung der Platzhalter.
+ *
+ * Die Motive bestehen aus weichen Verläufen und Silhouetten — die vertragen
+ * eine niedrige Auflösung praktisch verlustfrei, weil next/image sie ohnehin
+ * hochskaliert und Verläufe dabei nicht sichtbar leiden. 0.3 drückt die 58
+ * Dateien von rund 10 MB auf etwa 2 MB.
+ *
+ * Für eigene Fotos ist dieser Wert irrelevant — echte Bilder kommen in voller
+ * Auflösung nach public/images und werden in data/trip-data.ts eingetragen.
+ *
+ * Nach einer Änderung: `npm run placeholders` — das Script schreibt die neuen
+ * Maße automatisch auch nach data/trip-data.ts zurück.
+ */
+const SCALE = 0.3;
 
 const L = 'landscape';
 const P = 'panorama';
@@ -506,12 +522,43 @@ function tonePlaceholder(tone) {
 mkdirSync(OUT_DIR, { recursive: true });
 
 let totalBytes = 0;
+/** Name → tatsächlich geschriebene Maße, für den Abgleich mit trip-data.ts. */
+const written = new Map();
+
 for (const [name, w, h, tone, scene] of MANIFEST) {
-  const rgb = renderScene(w, h, tone, scene, `${name}:${tone}:${scene}`);
-  const png = encodePng(w, h, rgb);
+  const width = Math.max(2, Math.round(w * SCALE));
+  const height = Math.max(2, Math.round(h * SCALE));
+  // Seed bewusst ohne Maße — dasselbe Motiv bleibt bei jeder Skalierung gleich.
+  const rgb = renderScene(width, height, tone, scene, `${name}:${tone}:${scene}`);
+  const png = encodePng(width, height, rgb);
   writeFileSync(join(OUT_DIR, `${name}.png`), png);
+  written.set(name, { width, height });
   totalBytes += png.length;
 }
+
+/*
+ * Maße in data/trip-data.ts nachziehen.
+ *
+ * width/height dort müssen die echten Dateimaße beschreiben — sonst stimmen
+ * die von next/image erzeugten srcset-Kandidaten nicht. Angefasst werden nur
+ * Einträge, die auf einen generierten Platzhalter zeigen; eigene Fotos
+ * (andere Dateiendung oder anderer Name) bleiben unberührt.
+ */
+const tripDataPath = join(ROOT, 'data', 'trip-data.ts');
+let tripData = readFileSync(tripDataPath, 'utf8');
+let synced = 0;
+
+tripData = tripData.replace(
+  /(src: '\/images\/([\w-]+)\.png',[\s\S]{0,400}?width: )(\d+)(,[\s\S]{0,120}?height: )(\d+)(,)/g,
+  (match, head, name, oldWidth, mid, oldHeight, tail) => {
+    const size = written.get(name);
+    if (!size) return match;
+    synced += 1;
+    return `${head}${size.width}${mid}${size.height}${tail}`;
+  },
+);
+
+writeFileSync(tripDataPath, tripData);
 
 const toneEntries = Object.keys(TONES)
   .map((tone) => `  ${tone}: '${tonePlaceholder(tone)}',`)
@@ -533,5 +580,7 @@ ${toneEntries}
 );
 
 console.log(
-  `${MANIFEST.length} Platzhalter erzeugt (${(totalBytes / 1024 / 1024).toFixed(2)} MB) → public/images/`,
+  `${MANIFEST.length} Platzhalter erzeugt bei Skalierung ${SCALE} ` +
+    `(${(totalBytes / 1024 / 1024).toFixed(2)} MB) → public/images/\n` +
+    `${synced} Bildmaße in data/trip-data.ts abgeglichen.`,
 );
