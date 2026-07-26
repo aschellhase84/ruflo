@@ -6,9 +6,10 @@ import {
   useMotionValueEvent,
   useScroll,
 } from 'framer-motion';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { sections, trip } from '@/data/trip-data';
+import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { useScrollSpy } from '@/hooks/use-scroll-spy';
 import { cn } from '@/lib/utils';
 
@@ -29,6 +30,10 @@ export function FloatingNavigation() {
   const [menuOpen, setMenuOpen] = useState(false);
   const { scrollY } = useScroll();
 
+  const headerRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
   useMotionValueEvent(scrollY, 'change', (value) => {
     setCompact((current) => {
       // Hysterese: verhindert Flackern genau an der Schwelle.
@@ -40,27 +45,43 @@ export function FloatingNavigation() {
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
 
-  // Escape schließt das Menü, Body-Scroll wird solange gesperrt.
+  /*
+   * Menü beim Wechsel auf Desktopbreite schließen.
+   *
+   * Ab `md` blendet CSS sowohl das Overlay als auch den Menü-Schalter aus.
+   * Bliebe `menuOpen` dabei true, liefe die Scroll-Sperre weiter, ohne dass
+   * es noch eine sichtbare Möglichkeit zum Schließen gäbe — auf einem
+   * Touchgerät ohne Escape-Taste wäre die Seite dann unscrollbar. Auslöser
+   * dafür ist im Alltag das Drehen eines Tablets ins Querformat.
+   */
   useEffect(() => {
     if (!menuOpen) return;
 
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeMenu();
+    const query = window.matchMedia('(min-width: 768px)');
+    const check = () => {
+      if (query.matches) setMenuOpen(false);
     };
 
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    window.addEventListener('keydown', onKeyDown);
+    check();
+    query.addEventListener('change', check);
+    return () => query.removeEventListener('change', check);
+  }, [menuOpen]);
 
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [menuOpen, closeMenu]);
+  // Escape, Tab-Umlauf, Scroll-Sperre und Fokusrückgabe.
+  // Der Trap umfasst Header UND Overlay: Der Schalter zum Schließen sitzt im
+  // Header, die Menüpunkte im Overlay darunter — beides ist sichtbar und muss
+  // per Tastatur erreichbar bleiben.
+  useFocusTrap({
+    active: menuOpen,
+    containers: [headerRef, menuRef],
+    onEscape: closeMenu,
+    initialFocus: toggleRef,
+  });
 
   return (
     <>
       <header
+        ref={headerRef}
         className={cn(
           'fixed inset-x-0 z-40 flex justify-center px-4 transition-all duration-500 ease-cinema',
           compact ? 'top-2 sm:top-3' : 'top-4 sm:top-6',
@@ -119,6 +140,7 @@ export function FloatingNavigation() {
 
           {/* Mobile: Menü-Schalter */}
           <button
+            ref={toggleRef}
             type="button"
             onClick={() => setMenuOpen((open) => !open)}
             aria-expanded={menuOpen}
@@ -159,6 +181,7 @@ export function FloatingNavigation() {
       <AnimatePresence>
         {menuOpen ? (
           <motion.div
+            ref={menuRef}
             id="mobile-navigation"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
