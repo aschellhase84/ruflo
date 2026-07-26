@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { Photo } from '@/components/ui/photo';
+import { useFocusTrap } from '@/hooks/use-focus-trap';
 import type { GalleryItem } from '@/data/trip-data';
 
 interface ImageLightboxProps {
@@ -38,7 +39,6 @@ export function ImageLightbox({
   const [mounted, setMounted] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const lastFocused = useRef<HTMLElement | null>(null);
 
   const isOpen = index !== null;
   const total = items.length;
@@ -55,61 +55,34 @@ export function ImageLightbox({
     onNavigate((index + 1) % total);
   }, [index, onNavigate, total]);
 
-  // Tastatursteuerung + Scroll-Sperre + Fokusverwaltung
+  // Escape, Tab-Umlauf, Scroll-Sperre und Fokusrückgabe.
+  // Der Trap filtert auf SICHTBARE Elemente — die Blätter-Schaltflächen gibt
+  // es doppelt (Desktop an den Seiten, Mobile in der Fußzeile), immer ist nur
+  // ein Satz eingeblendet.
+  useFocusTrap({
+    active: isOpen,
+    containers: [dialogRef],
+    onEscape: onClose,
+    initialFocus: closeRef,
+  });
+
+  // Blättern per Pfeiltasten
   useEffect(() => {
     if (!isOpen) return;
 
-    lastFocused.current = document.activeElement as HTMLElement | null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        onClose();
-        return;
-      }
       if (event.key === 'ArrowLeft') {
         event.preventDefault();
         goPrev();
-        return;
-      }
-      if (event.key === 'ArrowRight') {
+      } else if (event.key === 'ArrowRight') {
         event.preventDefault();
         goNext();
-        return;
-      }
-      if (event.key !== 'Tab') return;
-
-      // Einfache Fokusfalle: Tab zirkuliert innerhalb des Dialogs.
-      const focusables = dialogRef.current?.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-      );
-      if (!focusables || focusables.length === 0) return;
-
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
       }
     };
 
     window.addEventListener('keydown', onKeyDown);
-    // Nach der Öffnungsanimation den Schließen-Button fokussieren.
-    const focusTimer = window.setTimeout(() => closeRef.current?.focus(), 80);
-
-    return () => {
-      window.removeEventListener('keydown', onKeyDown);
-      window.clearTimeout(focusTimer);
-      document.body.style.overflow = previousOverflow;
-      lastFocused.current?.focus?.();
-    };
-  }, [isOpen, onClose, goPrev, goNext]);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, goPrev, goNext]);
 
   const onDragEnd = (_event: unknown, info: PanInfo) => {
     if (info.offset.x < -SWIPE_THRESHOLD) goNext();
